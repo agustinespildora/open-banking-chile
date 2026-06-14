@@ -68,7 +68,8 @@ async function screenshotIfEnabled(page: Page, name: string, enabled: boolean, d
 async function login(page: Page, rut: string, password: string, debugLog: string[], doScreenshots: boolean, progress: (s: string) => void): Promise<{ success: true } | { success: false; error: string; screenshot?: string }> {
   debugLog.push("1. Navigating to bank homepage...");
   progress("Abriendo sitio del banco...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle" });
+  await page.goto(BANK_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle").catch(() => {});
   await delay(2000);
 
   // Dismiss banners/popups
@@ -172,11 +173,54 @@ async function login(page: Page, rut: string, password: string, debugLog: string
   return { success: true };
 }
 
+// ─── Modal / overlay dismissal ───────────────────────────────────
+
+/**
+ * Banco Falabella shows a post-login marketing modal (`#modal-message` with a
+ * `ModalMessage_overlay`) that sits on top of the page and intercepts pointer
+ * events, breaking account/CMR navigation. Dismiss it (close button → Escape →
+ * force-hide) before clicking anything underneath. The CSS-module class hashes
+ * are matched by substring so they survive build-hash changes.
+ */
+async function dismissOverlays(page: Page, debugLog: string[]): Promise<void> {
+  // The modal ("En estos momentos no podemos atender...") mounts a moment after
+  // the dashboard renders, so poll briefly for its "Entendido" button.
+  let dismissed = false;
+  for (let i = 0; i < 8; i++) {
+    const btn = page
+      .getByRole("button", { name: /^(entendido|aceptar|continuar|cerrar)$/i })
+      .first();
+    if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+      await btn.click({ timeout: 1500, force: true }).catch(() => {});
+      debugLog.push("  Dismissed post-login modal (button)");
+      dismissed = true;
+      await delay(400);
+      break;
+    }
+    await delay(400);
+  }
+
+  // Belt-and-suspenders: inject a persistent rule so the overlay can never
+  // intercept pointer events, even if it re-mounts after this point. CSS-module
+  // class hashes are matched by substring so they survive build-hash changes.
+  await page
+    .addStyleTag({
+      content:
+        "#modal-message,[class*='ModalMessage_overlay'],[class*='ModalMessage_show']{display:none !important;pointer-events:none !important;visibility:hidden !important;}",
+    })
+    .catch(() => {});
+
+  if (!dismissed) debugLog.push("  No post-login modal found (style neutralizer injected)");
+}
+
 // ─── Account movements ──────────────────────────────────────────
 
 async function scrapeAccountMovements(page: Page, debugLog: string[], doScreenshots: boolean, progress: (s: string) => void): Promise<{ movements: BankMovement[]; balance?: number }> {
   debugLog.push("7. [Cuenta] Looking for account...");
   progress("Buscando cartola de cuenta...");
+
+  // Dismiss the post-login modal overlay that intercepts navigation clicks.
+  await dismissOverlays(page, debugLog);
 
   // Try clicking on Cuenta Corriente product card
   const ccLink = page.getByRole("link", { name: /Cuenta Corriente \d/ });
@@ -898,7 +942,8 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
     // Phase 2: CMR credit card — navigate back to dashboard first
     debugLog.push("  Navigating back to dashboard for CMR...");
     progress("Navegando a tarjeta de crédito...");
-    await page.goto(dashboardUrl, { waitUntil: "networkidle" });
+    await page.goto(dashboardUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForLoadState("networkidle").catch(() => {});
     await delay(2000);
 
     // Close popups again
@@ -906,6 +951,9 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
       const closeBtn = page.getByRole("button", { name: "cerrar", exact: true });
       if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) await closeBtn.click();
     } catch { /* no popup */ }
+
+    // Dismiss the modal overlay again before CMR navigation clicks.
+    await dismissOverlays(page, debugLog);
 
     const { creditCard } = await scrapeCreditCard(page, debugLog, doScreenshots, progress, owner);
 
