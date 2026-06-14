@@ -35,6 +35,12 @@ export interface BankMovement {
   installments?: string;
   /** Monto total de la compra (distinto de amount cuando es en cuotas) */
   totalAmount?: number;
+  /**
+   * Moneda del `amount` (código ISO 4217, ej: "CLP", "USD"). Ausente ⇒ "CLP".
+   * Los movimientos internacionales (sección "Internacional" / glosas
+   * "COMPRAS INT"/"PAGOS INT") vienen en USD y NO se convierten a CLP.
+   */
+  currency?: string;
 }
 
 /** Saldo y movimientos de una cuenta bancaria */
