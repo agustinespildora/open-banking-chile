@@ -213,6 +213,41 @@ async function dismissOverlays(page: Page, debugLog: string[]): Promise<void> {
   if (!dismissed) debugLog.push("  No post-login modal found (style neutralizer injected)");
 }
 
+/**
+ * The www dashboard product cards (Cuenta Corriente, CMR Mastercard, …)
+ * lazy-load and sometimes fail to render after navigating back to the
+ * dashboard — the page shows the "no podemos atender / Reintentar" state
+ * instead. Poll for a product card and, if missing, click Reintentar and/or
+ * reload, retrying a few times.
+ */
+async function ensureDashboardProducts(page: Page, debugLog: string[]): Promise<void> {
+  const productCard = page
+    .locator("a[id^='cardDetail'], a.div-product")
+    .filter({ visible: true })
+    .first()
+    .or(page.getByRole("link", { name: /Cuenta Corriente \d/ }).first());
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await productCard.isVisible({ timeout: 12000 }).catch(() => false)) {
+      if (attempt > 0) debugLog.push(`  Dashboard products rendered (after ${attempt} retr${attempt === 1 ? "y" : "ies"})`);
+      return;
+    }
+    debugLog.push(`  Dashboard products not visible — recovery attempt ${attempt + 1}`);
+    const retry = page.getByRole("button", { name: /reintentar/i }).first()
+      .or(page.getByText(/reintentar/i).first());
+    if (await retry.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await retry.click({ force: true }).catch(() => {});
+      await delay(4000);
+    } else {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForLoadState("networkidle").catch(() => {});
+      await delay(4000);
+      await dismissOverlays(page, debugLog);
+    }
+  }
+  debugLog.push("  Dashboard products still not visible after retries");
+}
+
 // ─── Account movements ──────────────────────────────────────────
 
 async function scrapeAccountMovements(page: Page, debugLog: string[], doScreenshots: boolean, progress: (s: string) => void): Promise<{ movements: BankMovement[]; balance?: number }> {
@@ -425,26 +460,44 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
   debugLog.push("9. [CMR] Looking for CMR card...");
   progress("Navegando a tarjeta de crédito...");
 
-  // Extract cupos from dashboard
-  const cupoData = await extractCupos(page, debugLog);
-  if (cupoData) Object.assign(creditCard, cupoData);
+  // Hop 1: click the CMR product card on the www dashboard. This opens the
+  // separate "techbank-client" app on its product overview ("Mis Productos").
+  // Navigating to the techbank URL directly does NOT work — it bounces to the
+  // public (unauthenticated) homepage — so a click from the dashboard is
+  // required. Use a visible-only filter so the hidden "CMR Mastercard Elite"
+  // links never shadow the real product card.
+  const cmrCard = page
+    .locator("a[id^='cardDetail'], a.div-product")
+    .filter({ hasText: /CMR/i })
+    .filter({ visible: true })
+    .first();
+  const cmrFallback = page
+    .locator("a, button")
+    .filter({ hasText: /CMR\s*(Mastercard|Visa)|Tarjeta\s*CMR/i })
+    .filter({ visible: true })
+    .first();
+  const cmrLink = cmrCard.or(cmrFallback);
 
-  // Click on CMR product card
-  const cmrLink = page.getByRole("link", { name: /CMR/ }).first()
-    .or(page.locator("#cardDetail0, [id^='cardDetail']").first())
-    .or(page.locator("a, button, div").filter({ hasText: /CMR/i }).first());
-
-  if (!(await cmrLink.isVisible({ timeout: 5000 }).catch(() => false))) {
+  if (!(await cmrLink.isVisible({ timeout: 15000 }).catch(() => false))) {
     debugLog.push("  [CMR] No CMR card found on dashboard");
     return { movements: [], creditCard };
   }
 
-  await cmrLink.click();
+  await cmrLink.click({ force: true }).catch(() => {});
   await page.waitForLoadState("networkidle").catch(() => {});
   await delay(5000);
+  await screenshotIfEnabled(page, "06-cmr-overview", doScreenshots, debugLog);
+
+  // Cupos (Cupo de compras / utilizado / disponible) are shown on this overview.
+  const cupoData = await extractCupos(page, debugLog);
+  if (cupoData) Object.assign(creditCard, cupoData);
+
+  // Hop 2: click the CMR Mastercard product row on the overview to open the
+  // movements page (tabs: "Últimos movimientos" / "Movimientos facturados").
+  await ensureCmrMovementsView(page, debugLog);
   await screenshotIfEnabled(page, "06-cmr-card", doScreenshots, debugLog);
 
-  // Wait for CMR shadow DOM to render
+  // Wait for the movements tables to render (light DOM on the techbank app).
   await waitForCmrContent(page, CMR_WAIT_MS);
 
   // Owner filter
@@ -512,25 +565,77 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
 
 // ─── CMR Shadow DOM helpers ─────────────────────────────────────
 
+/**
+ * Wait until a movements table with at least one data cell is present. The
+ * current Falabella "techbank-client" app renders the tables in the light DOM
+ * (Angular emulated encapsulation), so we search the document and any shadow
+ * roots (legacy `credit-card-movements` web component) for robustness.
+ */
 async function waitForCmrContent(page: Page, timeoutMs: number): Promise<void> {
   try {
-    await page.waitForFunction((host: string) => {
-      const el = document.querySelector(host) as Element & { shadowRoot?: ShadowRoot };
-      if (!el?.shadowRoot) return false;
-      function collectAll(root: ShadowRoot | Element): Array<ShadowRoot | Element> {
-        const found: Array<ShadowRoot | Element> = [root];
-        for (const child of Array.from((root as Element).querySelectorAll("*"))) {
+    await page.waitForFunction(() => {
+      function collectRoots(root: Document | ShadowRoot | Element, acc: Array<Document | ShadowRoot | Element>): Array<Document | ShadowRoot | Element> {
+        acc.push(root);
+        for (const child of Array.from((root as ParentNode).querySelectorAll("*"))) {
           const sr = (child as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
-          if (sr) found.push(...collectAll(sr));
+          if (sr) collectRoots(sr, acc);
         }
-        return found;
+        return acc;
       }
-      return collectAll(el.shadowRoot).some(
-        r => (r as Element).querySelectorAll("table tbody tr td").length > 0,
+      return collectRoots(document, []).some(
+        r => (r as ParentNode).querySelectorAll("table tbody tr td").length > 0,
       );
-    }, "credit-card-movements", { timeout: timeoutMs });
+    }, undefined, { timeout: timeoutMs });
   } catch { /* timeout */ }
   await delay(500);
+}
+
+/** True when at least one populated movements table is on the page. */
+async function cmrTablesPresent(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    function collectRoots(root: Document | ShadowRoot | Element, acc: Array<Document | ShadowRoot | Element>): Array<Document | ShadowRoot | Element> {
+      acc.push(root);
+      for (const child of Array.from((root as ParentNode).querySelectorAll("*"))) {
+        const sr = (child as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
+        if (sr) collectRoots(sr, acc);
+      }
+      return acc;
+    }
+    return collectRoots(document, []).some(
+      r => (r as ParentNode).querySelectorAll("table tbody tr td").length > 0,
+    );
+  }).catch(() => false);
+}
+
+/**
+ * Hop 2 of CMR navigation: on the techbank-client "Mis Productos" overview, the
+ * movements page is only reached by clicking the CMR product row. If the
+ * movements tables are already present we do nothing.
+ *
+ * The overview contains hidden "CMR Mastercard Elite" anchors that must NOT be
+ * matched, so we restrict to visible elements.
+ */
+async function ensureCmrMovementsView(page: Page, debugLog: string[]): Promise<void> {
+  if (await cmrTablesPresent(page)) {
+    debugLog.push("  [CMR] Movements tables already present (skipping hop 2)");
+    return;
+  }
+  const row = page
+    .locator("text=/CMR\\s*Mastercard|CMR\\s*Visa/i")
+    .filter({ visible: true })
+    .first();
+
+  if (!(await row.isVisible({ timeout: 12000 }).catch(() => false))) {
+    debugLog.push("  [CMR] CMR product row not found on overview");
+    return;
+  }
+  await row.scrollIntoViewIfNeeded().catch(() => {});
+  await row.click().catch(async () => {
+    await row.click({ force: true }).catch(() => {});
+  });
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await delay(4000);
+  debugLog.push("  [CMR] Clicked CMR product row → movements view");
 }
 
 async function extractCupos(page: Page, debugLog: string[]): Promise<Partial<CreditCardBalance> | null> {
@@ -719,10 +824,13 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
     const result: { rows: BankMovement[]; firstRow: string; clicked: boolean } = await page.evaluate(
       ({ host: h, src, isBilled }: { host: string; src: string; isBilled: boolean }) => {
         const shadowEl = document.querySelector(h) as Element & { shadowRoot?: ShadowRoot };
-        const topRoot = shadowEl?.shadowRoot || document;
+        const topRoot: ShadowRoot | Document = shadowEl?.shadowRoot || document;
 
-        function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element> {
-          const found: Array<ShadowRoot | Element> = root instanceof Document ? [] : [root as Element];
+        // Include the top root itself (document or shadow root) so light-DOM
+        // tables on the techbank-client app are collected, plus any nested
+        // shadow roots from the legacy web component.
+        function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element | Document> {
+          const found: Array<ShadowRoot | Element | Document> = [root];
           for (const el of Array.from((root as ParentNode).querySelectorAll("*"))) {
             const sr = (el as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
             if (sr) found.push(...collectAll(sr));
@@ -850,9 +958,9 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
     const changed = await page.waitForFunction(
       ({ host: h, prev, billed }: { host: string; prev: string; billed: boolean }) => {
         const el = document.querySelector(h) as Element & { shadowRoot?: ShadowRoot };
-        const topRoot = el?.shadowRoot || document;
-        function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element> {
-          const found: Array<ShadowRoot | Element> = root instanceof Document ? [] : [root as Element];
+        const topRoot: ShadowRoot | Document = el?.shadowRoot || document;
+        function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element | Document> {
+          const found: Array<ShadowRoot | Element | Document> = [root];
           for (const child of Array.from((root as ParentNode).querySelectorAll("*"))) {
             const sr = (child as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
             if (sr) found.push(...collectAll(sr));
@@ -939,7 +1047,10 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
     // Phase 1: Account movements
     const { movements: accountMovements, balance } = await scrapeAccountMovements(page, debugLog, doScreenshots, progress);
 
-    // Phase 2: CMR credit card — navigate back to dashboard first
+    // Phase 2: CMR credit card — return to the www dashboard and click the CMR
+    // product card (the only reliable entry to the techbank app; a direct URL
+    // bounces to the public homepage). The product cards lazy-load and sometimes
+    // fail to render after navigating back, so recover robustly first.
     debugLog.push("  Navigating back to dashboard for CMR...");
     progress("Navegando a tarjeta de crédito...");
     await page.goto(dashboardUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -954,6 +1065,9 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
 
     // Dismiss the modal overlay again before CMR navigation clicks.
     await dismissOverlays(page, debugLog);
+
+    // Ensure the product cards actually rendered (reload + Reintentar if not).
+    await ensureDashboardProducts(page, debugLog);
 
     const { creditCard } = await scrapeCreditCard(page, debugLog, doScreenshots, progress, owner);
 
