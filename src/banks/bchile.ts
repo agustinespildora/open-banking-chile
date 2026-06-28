@@ -209,8 +209,18 @@ function cartolaMovToMovement(mov: ApiCartolaMov): BankMovement {
   return { date: normalizeDate(mov.fechaContable), description: mov.descripcion.trim(), amount: mov.tipo === "cargo" ? -Math.abs(mov.monto) : Math.abs(mov.monto), balance: mov.saldo, source: MOVEMENT_SOURCE.account };
 }
 
-function facturadoToMovement(tx: ApiTransaccionFacturada, source: MovementSource, cardMask?: string): BankMovement {
-  return { date: normalizeDate(tx.fechaTransaccionString), description: tx.descripcion.trim(), amount: tx.grupo === "pagos" ? Math.abs(tx.montoTransaccion) : -Math.abs(tx.montoTransaccion), balance: 0, source, card: cardMask, installments: normalizeInstallments(tx.cuotas) };
+/**
+ * Banco de Chile mezcla movimientos nacionales (CLP) e internacionales (USD)
+ * en la misma lista de no facturados. Los internacionales se reconocen por su
+ * glosa ("COMPRAS INT.VI", "PAGOS INT.VISA", etc.) y su monto viene en dólares
+ * sin convertir, así que hay que marcarlos con currency = "USD".
+ */
+function isInternationalGlosa(glosa: string): boolean {
+  return /\bINT\.(?:VI|VISA|MC|MASTER(?:CARD)?)\b|\b(?:COMPRAS|PAGOS|ABONOS|CARGOS)\s+INT\b|INTERNACIONAL/i.test(glosa);
+}
+
+function facturadoToMovement(tx: ApiTransaccionFacturada, source: MovementSource, cardMask?: string, currency = "CLP"): BankMovement {
+  return { date: normalizeDate(tx.fechaTransaccionString), description: tx.descripcion.trim(), amount: tx.grupo === "pagos" ? Math.abs(tx.montoTransaccion) : -Math.abs(tx.montoTransaccion), balance: 0, source, card: cardMask, installments: normalizeInstallments(tx.cuotas), currency };
 }
 
 async function fetchAccountMovements(page: Page, products: ApiProduct[], fullName: string, rut: string, debugLog: string[]): Promise<{ movements: BankMovement[]; balance?: number }> {
@@ -291,7 +301,8 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
       const unbilledMovs: BankMovement[] = [];
       for (const mov of nf.listaMovNoFactur) {
         const amount = mov.montoCompra < 0 ? Math.abs(mov.montoCompra) : -Math.abs(mov.montoCompra);
-        unbilledMovs.push({ date: normalizeDate(mov.fechaTransaccionString), description: mov.glosaTransaccion.trim(), amount, balance: 0, source: MOVEMENT_SOURCE.credit_card_unbilled, card: mascara, installments: normalizeInstallments(mov.despliegueCuotas) });
+        const currency = isInternationalGlosa(mov.glosaTransaccion) ? "USD" : "CLP";
+        unbilledMovs.push({ date: normalizeDate(mov.fechaTransaccionString), description: mov.glosaTransaccion.trim(), amount, balance: 0, source: MOVEMENT_SOURCE.credit_card_unbilled, card: mascara, installments: normalizeInstallments(mov.despliegueCuotas), currency });
       }
       // periodExpenses: suma de cargos no facturados (montos negativos → gastos)
       const periodExpensesRaw = nf.gastosPeriodo ?? nf.montoGastosPeriodo;
@@ -314,7 +325,7 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
             apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/nacional/resumen-por-fecha", resumenBody),
             apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/internacional/resumen-por-fecha", resumenBody),
           ]);
-          for (const r of [nacR, intR]) {
+          for (const [r, currency] of [[nacR, "CLP"], [intR, "USD"]] as const) {
             if (r.status !== "fulfilled" || !r.value.existeEstadoCuenta) continue;
             const res = r.value;
 
@@ -326,7 +337,7 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
               // Skip section-subtotal rows (e.g. "TOTAL PAGOS A LA CUENTA").
               const desc = tx.descripcion.trim().toUpperCase();
               if (desc.startsWith("TOTAL ") && desc.endsWith("A LA CUENTA")) continue;
-              movements.push(facturadoToMovement(tx, MOVEMENT_SOURCE.credit_card_billed, mascara));
+              movements.push(facturadoToMovement(tx, MOVEMENT_SOURCE.credit_card_billed, mascara, currency));
             }
 
             // Override nextBillingDate/nextDueDate with accurate date-format values from resumen
