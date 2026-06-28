@@ -108,11 +108,139 @@ export async function closePopups(page: Page): Promise<void> {
 
 // ─── Parsing ──────────────────────────────────────────────────
 
-/** Mapa de meses en español a número */
+/** Mapa de meses en español a número (abreviado y nombre completo). */
 export const MONTHS_MAP: Record<string, string> = {
-  ene: "01", feb: "02", mar: "03", abr: "04", may: "05", jun: "06",
-  jul: "07", ago: "08", sep: "09", oct: "10", nov: "11", dic: "12",
+  ene: "01", enero: "01",
+  feb: "02", febrero: "02",
+  mar: "03", marzo: "03",
+  abr: "04", abril: "04",
+  may: "05", mayo: "05",
+  jun: "06", junio: "06",
+  jul: "07", julio: "07",
+  ago: "08", agosto: "08",
+  sep: "09", septiembre: "09", setiembre: "09",
+  oct: "10", octubre: "10",
+  nov: "11", noviembre: "11",
+  dic: "12", diciembre: "12",
 };
+
+/** Mes en español → número 1–12 (headers de cartola). */
+export const MONTH_NAMES_NUM: Record<string, number> = Object.fromEntries(
+  Object.entries(MONTHS_MAP).map(([name, mm]) => [name, parseInt(mm, 10)]),
+) as Record<string, number>;
+
+export type CartolaDateContext = {
+  lastDate: string;
+  sectionMonth: number;
+  sectionYear: number;
+};
+
+export function createCartolaDateContext(
+  defaultYear = new Date().getFullYear(),
+): CartolaDateContext {
+  return { lastDate: "", sectionMonth: 0, sectionYear: defaultYear };
+}
+
+/** Detecta encabezados tipo "Mayo 2026" en cartolas bancarias. */
+export function parseMonthYearHeader(
+  text: string,
+  defaultYear = new Date().getFullYear(),
+): { month: number; year: number } | null {
+  const t = text.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!t) return null;
+  let month = 0;
+  for (const [name, num] of Object.entries(MONTH_NAMES_NUM)) {
+    if (new RegExp(`\\b${name}\\b`, "i").test(t)) {
+      month = num;
+      break;
+    }
+  }
+  if (!month) return null;
+  const yearMatch = t.match(/\b(20\d{2})\b/);
+  return { month, year: yearMatch ? parseInt(yearMatch[1], 10) : defaultYear };
+}
+
+function parseNumericDateParts(
+  raw: string,
+): { day: number; month: number; year?: number } | null {
+  const m = raw.trim().match(/^(\d{1,2})[\/.\-](\d{1,2})(?:[\/.\-](\d{2,4}))?$/);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  let year: number | undefined;
+  if (m[3]) {
+    year = m[3].length === 2 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10);
+  }
+  return { day, month, year };
+}
+
+function formatNumericDate(day: number, month: number, year: number): string {
+  return `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}/${year}`;
+}
+
+/**
+ * Resuelve fechas de cartola cuando la columna trae dd/mm, solo el día, o reusa lastDate.
+ * Usar junto con parseMonthYearHeader para secciones "Mes Año".
+ */
+export function resolveCartolaDate(
+  rawDate: string,
+  ctx: CartolaDateContext,
+  defaultYear = new Date().getFullYear(),
+): { date: string; ctx: CartolaDateContext } {
+  const trimmed = rawDate.trim();
+
+  if (!trimmed) {
+    return { date: ctx.lastDate, ctx };
+  }
+
+  const full = parseNumericDateParts(trimmed);
+  if (full) {
+    const year = full.year ?? (ctx.sectionYear || defaultYear);
+    const date = formatNumericDate(full.day, full.month, year);
+    return {
+      date,
+      ctx: {
+        lastDate: date,
+        sectionMonth: full.month,
+        sectionYear: year,
+      },
+    };
+  }
+
+  if (/^\d{1,2}$/.test(trimmed)) {
+    const day = parseInt(trimmed, 10);
+    if (ctx.sectionMonth > 0) {
+      const year = ctx.sectionYear || defaultYear;
+      const date = formatNumericDate(day, ctx.sectionMonth, year);
+      return { date, ctx: { ...ctx, lastDate: date } };
+    }
+    const prev = parseNumericDateParts(ctx.lastDate);
+    if (prev) {
+      const year = prev.year ?? ctx.sectionYear ?? defaultYear;
+      const date = formatNumericDate(day, prev.month, year);
+      return { date, ctx: { ...ctx, lastDate: date } };
+    }
+    return { date: "", ctx };
+  }
+
+  return { date: ctx.lastDate, ctx };
+}
+
+/** Aplica un header "Mayo 2026": resetea lastDate y fija mes de sección. */
+export function applyMonthYearHeader(
+  rowText: string,
+  ctx: CartolaDateContext,
+  defaultYear = new Date().getFullYear(),
+): CartolaDateContext | null {
+  const header = parseMonthYearHeader(rowText, defaultYear);
+  if (!header) return null;
+  return {
+    lastDate: "",
+    sectionMonth: header.month,
+    sectionYear: header.year,
+  };
+}
 
 /**
  * Parsea un monto en formato chileno a número entero.
