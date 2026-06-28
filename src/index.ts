@@ -66,3 +66,10 @@ export { default as santander } from "./banks/santander.js";
 export { default as bancosecurity } from "./banks/bancosecurity.js";
 export { default as scotiabank } from "./banks/scotiabank.js";
 export { default as cencosud } from "./banks/cencosud.js";
+
+export {
+  applyMonthYearHeader,
+  createCartolaDateContext,
+  parseMonthYearHeader,
+  resolveCartolaDate,
+} from "./utils.js";
