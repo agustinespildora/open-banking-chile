@@ -24,9 +24,25 @@ interface ApiCardSaldo { cupoTotalNacional: number; cupoUtilizadoNacional: numbe
 interface ApiMovNoFactur { origenTransaccion: string; fechaTransaccionString: string; montoCompra: number; glosaTransaccion: string; despliegueCuotas: string; }
 interface ApiNoFacturResponse { fechaProximaFacturacionCalendario: string; fechaProximoVencimiento?: string; fechaVencimiento?: string; gastosPeriodo?: number; montoGastosPeriodo?: number; listaMovNoFactur: ApiMovNoFactur[]; }
 interface ApiFechaFacturacion { fechaFacturacion: string; existeEstadoCuentaNacional: string; existeEstadoCuentaInternacional: string; }
-interface ApiTransaccionFacturada { fechaTransaccionString: string; montoTransaccion: number; descripcion: string; cuotas: string; grupo: string; }
+/**
+ * Fila de una sección del estado de cuenta. Las filas de subtotal vienen
+ * mezcladas con los movimientos y algunas llegan sin fecha ni monto, así que
+ * los dos campos son opcionales de verdad.
+ */
+interface ApiTransaccionFacturada {
+  fechaTransaccionString: string | null;
+  montoTransaccion: number | null;
+  descripcion: string | null;
+  cuotas?: string;
+  grupo?: string;
+  /** `true` en los subtotales de sección ("TOTAL PAGOS A LA CUENTA"). */
+  totales?: boolean;
+  /** `true` en el total por tarjeta ("TOTAL TARJETA ****1234"), que llega sin fecha. */
+  cambioTarjeta?: boolean;
+}
 interface ApiResumenNested { montoFacturado?: number; pagoMinimo?: number; fechaFacturacionActual?: string; fechaVencimientoFacturacion?: string; fechaProximaFacturacion?: string; }
-interface ApiResumenFacturado { existeEstadoCuenta: boolean; seccionOperaciones?: { transaccionesTarjetas: ApiTransaccionFacturada[] }; seccionCargosImpuestosAbonos?: { transaccionesTarjetas: ApiTransaccionFacturada[] | null }; resumen?: ApiResumenNested; totalFacturado?: number; montoTotalFacturado?: number; montoTotal?: number; fechaVencimiento?: string; fechaPago?: string; pagoMinimo?: number; montoMinimoPago?: number; montoMinimoAPagar?: number; }
+interface ApiSeccionFacturada { transaccionesTarjetas?: ApiTransaccionFacturada[] | null; }
+interface ApiResumenFacturado { existeEstadoCuenta: boolean; seccionOperaciones?: ApiSeccionFacturada; seccionCargosImpuestosAbonos?: ApiSeccionFacturada; resumen?: ApiResumenNested; totalFacturado?: number; montoTotalFacturado?: number; montoTotal?: number; fechaVencimiento?: string; fechaPago?: string; pagoMinimo?: number; montoMinimoPago?: number; montoMinimoAPagar?: number; }
 interface ApiCartolaMov { descripcion: string; monto: number; saldo: number; tipo: string; fechaContable: string; }
 type ApiCartolaResponse = { movimientos: ApiCartolaMov[]; pagina: Array<{ totalRegistros: number; masPaginas: boolean }> };
 
@@ -219,8 +235,56 @@ function isInternationalGlosa(glosa: string): boolean {
   return /\bINT\.(?:VI|VISA|MC|MASTER(?:CARD)?)\b|\b(?:COMPRAS|PAGOS|ABONOS|CARGOS)\s+INT\b|INTERNACIONAL/i.test(glosa);
 }
 
-function facturadoToMovement(tx: ApiTransaccionFacturada, source: MovementSource, cardMask?: string, currency = "CLP"): BankMovement {
-  return { date: normalizeDate(tx.fechaTransaccionString), description: tx.descripcion.trim(), amount: tx.grupo === "pagos" ? Math.abs(tx.montoTransaccion) : -Math.abs(tx.montoTransaccion), balance: 0, source, card: cardMask, installments: normalizeInstallments(tx.cuotas), currency };
+function facturadoToMovement(tx: ApiTransaccionFacturada, date: string, amount: number, source: MovementSource, cardMask?: string, currency = "CLP"): BankMovement {
+  return { date: normalizeDate(date), description: (tx.descripcion ?? "").trim(), amount: tx.grupo === "pagos" ? Math.abs(amount) : -Math.abs(amount), balance: 0, source, card: cardMask, installments: normalizeInstallments(tx.cuotas), currency };
+}
+
+/**
+ * ¿La fila es un subtotal y no un movimiento? Vienen tres formas:
+ *
+ * - `totales: true`, p. ej. "TOTAL PAGOS A LA CUENTA".
+ * - `cambioTarjeta: true`, el total por tarjeta ("TOTAL TARJETA ****1234"),
+ *   que llega con `totales: false` y sin fecha.
+ * - Sin ninguna marca, solo la glosa "TOTAL … A LA CUENTA" (payloads viejos).
+ */
+function isStatementSubtotalRow(tx: ApiTransaccionFacturada): boolean {
+  if (tx.totales === true || tx.cambioTarjeta === true) return true;
+  const desc = (tx.descripcion ?? "").trim().toUpperCase();
+  return desc.startsWith("TOTAL ") && desc.endsWith("A LA CUENTA");
+}
+
+/**
+ * Movimientos de un estado de cuenta facturado (`…/resumen-por-fecha`).
+ *
+ * Cada fila se valida antes de mapearla: el total por tarjeta llega sin fecha
+ * y `normalizeDate` explotaba con él, cortando el recorrido a mitad de camino.
+ * Como el llamador se comía la excepción, se perdían en silencio todas las
+ * filas que venían después: la sección de cargos, comisiones, impuestos e
+ * intereses (comisión de administración, intereses rotativos, interés de mora,
+ * impuesto DL 3475) y el estado de cuenta internacional entero.
+ *
+ * `skipped` son las filas descartadas por no tener fecha o monto usables, para
+ * que el debug log las muestre en vez de que desaparezcan sin rastro.
+ */
+export function billedStatementMovements(res: ApiResumenFacturado, cardMask?: string, currency = "CLP"): { movements: BankMovement[]; skipped: string[] } {
+  const movements: BankMovement[] = [];
+  const skipped: string[] = [];
+  const sections = [res.seccionOperaciones, res.seccionCargosImpuestosAbonos];
+
+  for (const section of sections) {
+    for (const tx of section?.transaccionesTarjetas ?? []) {
+      if (isStatementSubtotalRow(tx)) continue;
+      const date = (tx.fechaTransaccionString ?? "").trim();
+      // `Number(null)` es 0, así que un monto ausente pasaría como movimiento de $0.
+      const amount = tx.montoTransaccion == null ? Number.NaN : Number(tx.montoTransaccion);
+      const label = (tx.descripcion ?? "(sin glosa)").trim();
+      if (!date) { skipped.push(`${label} (sin fecha)`); continue; }
+      if (!Number.isFinite(amount)) { skipped.push(`${label} (sin monto)`); continue; }
+      movements.push(facturadoToMovement(tx, date, amount, MOVEMENT_SOURCE.credit_card_billed, cardMask, currency));
+    }
+  }
+
+  return { movements, skipped };
 }
 
 async function fetchAccountMovements(page: Page, products: ApiProduct[], fullName: string, rut: string, debugLog: string[]): Promise<{ movements: BankMovement[]; balance?: number }> {
@@ -329,16 +393,10 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
             if (r.status !== "fulfilled" || !r.value.existeEstadoCuenta) continue;
             const res = r.value;
 
-            const allTx = [
-              ...(res.seccionOperaciones?.transaccionesTarjetas ?? []),
-              ...(res.seccionCargosImpuestosAbonos?.transaccionesTarjetas ?? []),
-            ];
-            for (const tx of allTx) {
-              // Skip section-subtotal rows (e.g. "TOTAL PAGOS A LA CUENTA").
-              const desc = tx.descripcion.trim().toUpperCase();
-              if (desc.startsWith("TOTAL ") && desc.endsWith("A LA CUENTA")) continue;
-              movements.push(facturadoToMovement(tx, MOVEMENT_SOURCE.credit_card_billed, mascara, currency));
-            }
+            const billed = billedStatementMovements(res, mascara, currency);
+            movements.push(...billed.movements);
+            debugLog.push(`  Estado de cuenta ${currency} ${latestFecha}: ${billed.movements.length} movimiento(s)`);
+            if (billed.skipped.length > 0) debugLog.push(`    Filas sin fecha o monto usables: ${billed.skipped.join("; ")}`);
 
             // Override nextBillingDate/nextDueDate with accurate date-format values from resumen
             if (res.resumen?.fechaProximaFacturacion) ccEntry.nextBillingDate = normalizeDate(res.resumen.fechaProximaFacturacion);
@@ -363,7 +421,10 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
           }
         }
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      // Sin este log, un estado de cuenta que falla se ve igual que uno vacío.
+      debugLog.push(`  Error leyendo el estado de cuenta facturado: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   return { movements, creditCards };
