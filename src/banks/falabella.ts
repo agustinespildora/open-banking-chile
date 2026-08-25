@@ -4,6 +4,7 @@ import { chromium, type Browser, type Page } from "playwright-core";
 import type { BankMovement, BankScraper, CreditCardBalance, MovementSource, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { DebugLog, delay, deduplicateAcrossSources, deduplicateMovements, findChrome, monthYearLabel, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount, createCartolaDateContext, applyMonthYearHeader, resolveCartolaDate } from "../utils.js";
+import { submitFalabellaLogin } from "./falabella-login.js";
 
 // ─── Constants ───────────────────────────────────────────────────
 
@@ -79,58 +80,22 @@ async function login(page: Page, rut: string, password: string, debugLog: string
   } catch { /* no banner */ }
   await screenshotIfEnabled(page, "01-homepage", doScreenshots, debugLog);
 
-  // Click "Mi cuenta" (triggers navigation)
-  debugLog.push("2. Clicking 'Mi cuenta'...");
+  // The public site now renders the login form inside a right-side
+  // `DrawerFormLogin` panel instead of navigating to a two-step modal, so RUT
+  // and clave live on screen at the same time.
+  debugLog.push("2. Opening login form...");
   progress("Ingresando a Mi cuenta...");
   try {
-    await page.locator('a, button').filter({ hasText: "Mi cuenta" }).first().click({ timeout: 5000 });
-  } catch { /* may cause navigation context change */ }
-  await page.waitForLoadState("networkidle").catch(() => {});
-  await delay(3000);
+    await submitFalabellaLogin(page, rut, password, debugLog);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    debugLog.push(`  Login form failed: ${message}`);
+    await screenshotIfEnabled(page, "02-login-form", doScreenshots, debugLog);
+    const ss = await page.screenshot().then((b) => b.toString("base64")).catch(() => undefined);
+    return { success: false, error: `No se pudo completar el formulario de login: ${message}`, screenshot: ss };
+  }
   await screenshotIfEnabled(page, "02-login-form", doScreenshots, debugLog);
-
-  // Fill RUT
-  debugLog.push("3. Filling RUT...");
-  progress("Ingresando RUT...");
-  const rutInput = page.getByRole("textbox", { name: "RUT", exact: true })
-    .or(page.locator('input[name*="rut"], input[id*="rut"], input[placeholder*="RUT"]').first());
-  try {
-    await rutInput.fill(rut, { timeout: 10000 });
-  } catch {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: "No se encontró campo de RUT", screenshot: ss };
-  }
-  await delay(1000);
-
-  // Advance to password step (Falabella uses two-step modal)
-  await page.keyboard.press("Enter");
-  debugLog.push("  Pressed Enter to advance to password step");
-  await delay(2000);
-
-  // Fill password
-  debugLog.push("4. Filling password...");
-  progress("Ingresando clave...");
-  const pwdInput = page.locator('input[type="password"]').first()
-    .or(page.getByRole("textbox", { name: /[Cc]lave/ }).first());
-  try {
-    await pwdInput.fill(password, { timeout: 10000 });
-  } catch {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: "No se encontró campo de clave", screenshot: ss };
-  }
-  await delay(500);
-
-  // Submit login
-  debugLog.push("5. Submitting login...");
   progress("Iniciando sesión...");
-  // Try clicking submit button, fallback to Enter
-  const submitBtn = page.locator('button[type="submit"], input[type="submit"]').first()
-    .or(page.getByRole("button", { name: /ingresar|entrar|btn-md/i }).first());
-  try {
-    await submitBtn.click({ timeout: 3000 });
-  } catch {
-    await page.keyboard.press("Enter");
-  }
 
   await page.waitForLoadState("networkidle").catch(() => {});
   await delay(8000);
