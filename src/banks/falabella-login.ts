@@ -11,7 +11,20 @@ export const FALABELLA_LOGIN_SELECTORS = {
   password: '#pass, input[name="pass"]',
   submit: '[class*="DrawerFormLogin"] button[type="submit"]',
   loanCalculator: '[class*="loanCalculator"]',
+  legacyRut: '#rut, input[name="rut"], input[id*="rut" i]',
 } as const;
+
+export type FalabellaLoginSurface = "drawer" | "legacy" | "unknown";
+
+/** Decide drawer vs two-step form from which RUT field is on screen. Drawer wins if both are. */
+export function resolveFalabellaLoginSurface(input: {
+  drawerRutVisible: boolean;
+  legacyRutVisible: boolean;
+}): FalabellaLoginSurface {
+  if (input.drawerRutVisible) return "drawer";
+  if (input.legacyRutVisible) return "legacy";
+  return "unknown";
+}
 
 /** RUT as `12345678-9` (max 10 chars on the new field). Dots and spaces stripped. */
 export function formatFalabellaLoginRut(rut: string): string {
@@ -40,11 +53,22 @@ async function fillReactInput(locator: Locator, value: string): Promise<void> {
   await locator.blur();
 }
 
-export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): Promise<void> {
+function falabellaLegacyRutField(page: Page): Locator {
+  return page.getByRole("textbox", { name: /rut/i })
+    .or(page.locator(FALABELLA_LOGIN_SELECTORS.legacyRut))
+    .first();
+}
+
+async function waitForDrawerRut(rutField: Locator, timeout: number): Promise<boolean> {
+  return rutField.waitFor({ state: "visible", timeout }).then(() => true).catch(() => false);
+}
+
+export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): Promise<boolean> {
   const drawer = page.locator(FALABELLA_LOGIN_SELECTORS.drawer);
+  const rutField = page.locator(FALABELLA_LOGIN_SELECTORS.rut).first();
   if (await drawer.isVisible().catch(() => false)) {
     debugLog.push("[LOGIN] Drawer already open");
-    return;
+    return rutField.isVisible().catch(() => false);
   }
 
   const headerLogin = page.getByRole("button", { name: /^mi cuenta$/i }).first();
@@ -56,9 +80,24 @@ export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): 
     await page.locator("a, button").filter({ hasText: /mi cuenta/i }).first().click({ timeout: 10_000 });
   }
 
-  const rutField = page.locator(FALABELLA_LOGIN_SELECTORS.rut).first();
-  const appeared = await rutField.waitFor({ state: "visible", timeout: 12_000 }).then(() => true).catch(() => false);
-  if (appeared) return;
+  if (await waitForDrawerRut(rutField, 12_000)) return true;
+
+  const surface = resolveFalabellaLoginSurface({
+    drawerRutVisible: await rutField.isVisible().catch(() => false),
+    legacyRutVisible: await falabellaLegacyRutField(page).isVisible().catch(() => false),
+  });
+  switch (surface) {
+    case "drawer":
+      return true;
+    case "legacy":
+      return false;
+    case "unknown":
+      break;
+    default: {
+      const _exhaustive: never = surface;
+      return _exhaustive;
+    }
+  }
 
   debugLog.push("[LOGIN] Drawer RUT not visible, trying dropdown Ingresar / Mi cuenta");
   const ingresar = page.getByRole("button", { name: /^ingresar$/i }).first();
@@ -69,7 +108,11 @@ export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): 
   if (await miCuentaLink.isVisible().catch(() => false)) {
     await miCuentaLink.click();
   }
-  await rutField.waitFor({ state: "visible", timeout: 12_000 });
+
+  if (await waitForDrawerRut(rutField, 12_000)) return true;
+
+  debugLog.push("[LOGIN] Drawer RUT still not visible, will try legacy two-step form");
+  return false;
 }
 
 export async function submitFalabellaDrawerLogin(
@@ -128,9 +171,7 @@ export async function submitFalabellaLegacyLogin(
   const formattedRut = formatFalabellaLoginRut(rut);
   debugLog.push("[LOGIN] Using legacy two-step form");
 
-  const rutField = page.getByRole("textbox", { name: /rut/i })
-    .or(page.locator('#rut, input[name="rut"], input[id*="rut" i]'))
-    .first();
+  const rutField = falabellaLegacyRutField(page);
   await fillReactInput(rutField, formattedRut);
   await page.keyboard.press("Enter");
   await page.waitForTimeout(2000);
@@ -152,10 +193,7 @@ export async function submitFalabellaLogin(
   password: string,
   debugLog: string[],
 ): Promise<void> {
-  await openFalabellaLoginDrawer(page, debugLog);
-
-  const drawerRut = page.locator(FALABELLA_LOGIN_SELECTORS.rut).first();
-  if (await drawerRut.isVisible().catch(() => false)) {
+  if (await openFalabellaLoginDrawer(page, debugLog)) {
     await submitFalabellaDrawerLogin(page, rut, password, debugLog);
     return;
   }
