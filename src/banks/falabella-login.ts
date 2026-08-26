@@ -16,6 +16,19 @@ export const FALABELLA_LOGIN_SELECTORS = {
 
 export type FalabellaLoginSurface = "drawer" | "legacy" | "unknown";
 
+/**
+ * Scope a selector list so it cannot reach inside the home loan calculator.
+ * That simulator carries its own RUT input (placeholder `RUT`, and ids like
+ * `rut-simulador`), so an unscoped match makes the home page look like the
+ * legacy login and the two-step form ends up filling the simulator.
+ */
+export function excludeLoanCalculator(selectorList: string): string {
+  return selectorList
+    .split(",")
+    .map((sel) => `${sel.trim()}:not(${FALABELLA_LOGIN_SELECTORS.loanCalculator} *)`)
+    .join(", ");
+}
+
 /** Decide drawer vs two-step form from which RUT field is on screen. Drawer wins if both are. */
 export function resolveFalabellaLoginSurface(input: {
   drawerRutVisible: boolean;
@@ -54,9 +67,7 @@ async function fillReactInput(locator: Locator, value: string): Promise<void> {
 }
 
 function falabellaLegacyRutField(page: Page): Locator {
-  return page.getByRole("textbox", { name: /rut/i })
-    .or(page.locator(FALABELLA_LOGIN_SELECTORS.legacyRut))
-    .first();
+  return page.locator(excludeLoanCalculator(FALABELLA_LOGIN_SELECTORS.legacyRut)).first();
 }
 
 async function waitForDrawerRut(rutField: Locator, timeout: number): Promise<boolean> {

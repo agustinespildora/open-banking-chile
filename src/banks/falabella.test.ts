@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  excludeLoanCalculator,
   FALABELLA_LOGIN_SELECTORS,
   formatFalabellaLoginRut,
   resolveFalabellaLoginSurface,
@@ -21,6 +22,30 @@ describe("formatFalabellaLoginRut", () => {
   it("formats a 7-digit body plus DV into 9 characters", () => {
     expect(formatFalabellaLoginRut("1234567-8")).toBe("1234567-8");
   });
+
+  it("keeps an 8-digit body plus DV within the 10-char field, K included", () => {
+    expect(formatFalabellaLoginRut("12345678K")).toBe("12345678-K");
+    expect(formatFalabellaLoginRut("12345678K")).toHaveLength(10);
+    expect(formatFalabellaLoginRut("123456789")).toHaveLength(10);
+  });
+});
+
+describe("excludeLoanCalculator", () => {
+  it("scopes every selector in the list away from the loan calculator", () => {
+    expect(excludeLoanCalculator('#rut, input[name="rut"]')).toBe(
+      '#rut:not([class*="loanCalculator"] *), input[name="rut"]:not([class*="loanCalculator"] *)',
+    );
+  });
+
+  it("scopes the legacy RUT list so a rut-like simulator input cannot match", () => {
+    const scoped = excludeLoanCalculator(FALABELLA_LOGIN_SELECTORS.legacyRut);
+    expect(scoped.split(",")).toHaveLength(
+      FALABELLA_LOGIN_SELECTORS.legacyRut.split(",").length,
+    );
+    for (const part of scoped.split(",")) {
+      expect(part).toContain(':not([class*="loanCalculator"] *)');
+    }
+  });
 });
 
 describe("FALABELLA_LOGIN_SELECTORS", () => {
@@ -40,6 +65,7 @@ describe("FALABELLA_LOGIN_SELECTORS", () => {
     expect(FALABELLA_LOGIN_SELECTORS.legacyRut).toContain("#rut");
     expect(FALABELLA_LOGIN_SELECTORS.legacyRut).toContain('input[name="rut"]');
     expect(FALABELLA_LOGIN_SELECTORS.legacyRut).not.toContain("#document");
+    expect(FALABELLA_LOGIN_SELECTORS.legacyRut).not.toContain("placeholder");
   });
 });
 
