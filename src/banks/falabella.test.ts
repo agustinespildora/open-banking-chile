@@ -61,6 +61,12 @@ describe("FALABELLA_LOGIN_SELECTORS", () => {
     expect(FALABELLA_LOGIN_SELECTORS.password).toContain('input[name="pass"]');
   });
 
+  it("restricts the dropdown Ingresar to enabled buttons, so the drawer's disabled submit is not a dead end", () => {
+    expect(FALABELLA_LOGIN_SELECTORS.enabledButton).toContain(":not([disabled])");
+    expect(FALABELLA_LOGIN_SELECTORS.enabledButton.startsWith("button")).toBe(true);
+    expect(FALABELLA_LOGIN_SELECTORS.submit).toContain('button[type="submit"]');
+  });
+
   it("targets the legacy two-step RUT by id and name, not the drawer document field", () => {
     expect(FALABELLA_LOGIN_SELECTORS.legacyRut).toContain("#rut");
     expect(FALABELLA_LOGIN_SELECTORS.legacyRut).toContain('input[name="rut"]');

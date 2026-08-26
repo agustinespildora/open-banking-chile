@@ -12,6 +12,7 @@ export const FALABELLA_LOGIN_SELECTORS = {
   submit: '[class*="DrawerFormLogin"] button[type="submit"]',
   loanCalculator: '[class*="loanCalculator"]',
   legacyRut: '#rut, input[name="rut"], input[id*="rut" i]',
+  enabledButton: "button:not([disabled])",
 } as const;
 
 export type FalabellaLoginSurface = "drawer" | "legacy" | "unknown";
@@ -70,8 +71,42 @@ function falabellaLegacyRutField(page: Page): Locator {
   return page.locator(excludeLoanCalculator(FALABELLA_LOGIN_SELECTORS.legacyRut)).first();
 }
 
+/**
+ * The header dropdown opens with `Ingresar`, but so is the drawer's own submit
+ * named, and that one starts disabled until React validates RUT and clave. If
+ * the drawer is up and we just failed to find its RUT field, the disabled
+ * submit is the only `Ingresar` on screen, so requiring an enabled button is
+ * what keeps this from being a dead end.
+ */
+function enabledIngresarButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^ingresar$/i })
+    .and(page.locator(FALABELLA_LOGIN_SELECTORS.enabledButton))
+    .first();
+}
+
 async function waitForDrawerRut(rutField: Locator, timeout: number): Promise<boolean> {
   return rutField.waitFor({ state: "visible", timeout }).then(() => true).catch(() => false);
+}
+
+/**
+ * Every click that tries to open the drawer is best effort. A control that is
+ * missing, covered or permanently disabled must not abort the opener: it has to
+ * keep going and, failing everything, hand over to the legacy two-step form.
+ */
+async function clickIfPossible(
+  locator: Locator,
+  label: string,
+  debugLog: string[],
+  timeout = 8_000,
+): Promise<boolean> {
+  try {
+    await locator.click({ timeout });
+    return true;
+  } catch {
+    debugLog.push(`[LOGIN] Could not click ${label}`);
+    return false;
+  }
 }
 
 export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): Promise<boolean> {
@@ -85,10 +120,15 @@ export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): 
   const headerLogin = page.getByRole("button", { name: /^mi cuenta$/i }).first();
   if (await headerLogin.isVisible({ timeout: 8_000 }).catch(() => false)) {
     debugLog.push("[LOGIN] Opening drawer via Mi Cuenta");
-    await headerLogin.click();
+    await clickIfPossible(headerLogin, "Mi Cuenta", debugLog);
   } else {
     debugLog.push("[LOGIN] Mi Cuenta button not found, trying text match");
-    await page.locator("a, button").filter({ hasText: /mi cuenta/i }).first().click({ timeout: 10_000 });
+    await clickIfPossible(
+      page.locator("a, button").filter({ hasText: /mi cuenta/i }).first(),
+      "Mi cuenta (text match)",
+      debugLog,
+      10_000,
+    );
   }
 
   if (await waitForDrawerRut(rutField, 12_000)) return true;
@@ -111,13 +151,13 @@ export async function openFalabellaLoginDrawer(page: Page, debugLog: string[]): 
   }
 
   debugLog.push("[LOGIN] Drawer RUT not visible, trying dropdown Ingresar / Mi cuenta");
-  const ingresar = page.getByRole("button", { name: /^ingresar$/i }).first();
+  const ingresar = enabledIngresarButton(page);
   if (await ingresar.isVisible().catch(() => false)) {
-    await ingresar.click();
+    await clickIfPossible(ingresar, "Ingresar", debugLog);
   }
   const miCuentaLink = page.getByRole("link", { name: /mi cuenta/i }).first();
   if (await miCuentaLink.isVisible().catch(() => false)) {
-    await miCuentaLink.click();
+    await clickIfPossible(miCuentaLink, "Mi cuenta (dropdown)", debugLog);
   }
 
   if (await waitForDrawerRut(rutField, 12_000)) return true;
