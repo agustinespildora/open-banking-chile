@@ -30,6 +30,9 @@ Opciones:
   --pretty         Formatear JSON con indentación
   --movements      Solo imprimir movimientos (sin metadata)
   --owner <T|A|B>  Filtro Titular/Adicional para TC (default: B = todos)
+  --statement-months <N>
+                   Estados de cuenta de TC a leer, del más reciente hacia
+                   atrás (default: 1). Solo Banco de Chile.
   --help, -h       Mostrar esta ayuda
 
 Variables de entorno:
@@ -114,6 +117,11 @@ Ejemplos:
   const ownerVal = ownerIdx >= 0 ? args[ownerIdx + 1]?.toUpperCase() : undefined;
   const owner = ownerVal === "T" || ownerVal === "A" || ownerVal === "B" ? ownerVal : undefined;
 
+  // Parse --statement-months flag
+  const monthsIdx = args.indexOf("--statement-months");
+  const monthsVal = monthsIdx >= 0 ? Number(args[monthsIdx + 1]) : Number.NaN;
+  const statementMonths = Number.isFinite(monthsVal) && monthsVal >= 1 ? Math.trunc(monthsVal) : undefined;
+
   if (isTTY) {
     spinner.start(`Conectando con ${bank.name}...`);
   } else {
@@ -127,6 +135,7 @@ Ejemplos:
     saveScreenshots: flags.has("--screenshots"),
     headful: flags.has("--headful"),
     ...(owner && { owner }),
+    ...(statementMonths && { statementMonths }),
     onProgress: isTTY ? (step) => spinner.update(step) : undefined,
   });
 

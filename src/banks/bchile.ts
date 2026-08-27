@@ -287,6 +287,23 @@ export function billedStatementMovements(res: ApiResumenFacturado, cardMask?: st
   return { movements, skipped };
 }
 
+/** Default de `statementMonths`: solo el estado de cuenta más reciente. */
+const DEFAULT_STATEMENT_MONTHS = 1;
+
+/**
+ * Fechas de facturación a leer, de la más reciente a la más vieja.
+ *
+ * Un movimiento de TC deja de estar en el feed de no facturados en cuanto se
+ * factura, y a partir de ahí el banco solo lo expone dentro del estado de
+ * cuenta de ese período. Leyendo un solo estado de cuenta, todo lo facturado en
+ * períodos anteriores queda fuera de alcance para siempre.
+ */
+export function statementDatesToRead(lista: Pick<ApiFechaFacturacion, "fechaFacturacion">[] | null | undefined, statementMonths?: number): string[] {
+  const wanted = Math.max(1, Math.trunc(statementMonths ?? DEFAULT_STATEMENT_MONTHS) || DEFAULT_STATEMENT_MONTHS);
+  const dates = (lista ?? []).map(f => f?.fechaFacturacion).filter((f): f is string => typeof f === "string" && f.trim() !== "");
+  return [...new Set(dates)].slice(0, wanted);
+}
+
 async function fetchAccountMovements(page: Page, products: ApiProduct[], fullName: string, rut: string, debugLog: string[]): Promise<{ movements: BankMovement[]; balance?: number }> {
   const accounts = products.filter(p => p.tipo === "cuenta" || p.tipo === "cuentaCorrienteMonedaLocal");
   const seenNums = new Set<string>();
@@ -330,7 +347,7 @@ async function fetchAccountMovements(page: Page, products: ApiProduct[], fullNam
   return { movements, balance };
 }
 
-async function fetchCreditCardData(page: Page, fullName: string, debugLog: string[]): Promise<{ movements: BankMovement[]; creditCards: CreditCardBalance[] }> {
+async function fetchCreditCardData(page: Page, fullName: string, debugLog: string[], statementMonths?: number): Promise<{ movements: BankMovement[]; creditCards: CreditCardBalance[] }> {
   const movements: BankMovement[] = [];
   const creditCards: CreditCardBalance[] = [];
 
@@ -381,41 +398,51 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
       const fechas = await apiPost<{ existenEstadosDeCuenta: boolean; numeroCuenta: string | null; listaNacional: ApiFechaFacturacion[]; listaInternacional: ApiFechaFacturacion[] }>(page, "tarjetas/estadocuenta/fechas-facturacion", baseBody);
       if (fechas.existenEstadosDeCuenta) {
         const ccEntry = creditCards[creditCards.length - 1];
-        const latestFecha = fechas.listaNacional?.[0]?.fechaFacturacion;
         const numeroCuenta = fechas.numeroCuenta;
-        if (latestFecha && numeroCuenta) {
-          const resumenBody = { ...baseBody, fechaFacturacion: latestFecha, numeroCuenta };
-          const [nacR, intR] = await Promise.allSettled([
-            apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/nacional/resumen-por-fecha", resumenBody),
-            apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/internacional/resumen-por-fecha", resumenBody),
-          ]);
-          for (const [r, currency] of [[nacR, "CLP"], [intR, "USD"]] as const) {
-            if (r.status !== "fulfilled" || !r.value.existeEstadoCuenta) continue;
-            const res = r.value;
+        const fechasFacturacion = statementDatesToRead(fechas.listaNacional, statementMonths);
+        if (numeroCuenta && fechasFacturacion.length > 0) {
+          debugLog.push(`  Estados de cuenta a leer: ${fechasFacturacion.join(", ")} (de ${(fechas.listaNacional ?? []).length} disponible(s))`);
 
-            const billed = billedStatementMovements(res, mascara, currency);
-            movements.push(...billed.movements);
-            debugLog.push(`  Estado de cuenta ${currency} ${latestFecha}: ${billed.movements.length} movimiento(s)`);
-            if (billed.skipped.length > 0) debugLog.push(`    Filas sin fecha o monto usables: ${billed.skipped.join("; ")}`);
+          for (const [index, fechaFacturacion] of fechasFacturacion.entries()) {
+            // La metadata de la tarjeta (próxima facturación, vencimiento,
+            // último estado de cuenta) sale del más reciente; los anteriores
+            // solo aportan movimientos.
+            const isLatest = index === 0;
+            const resumenBody = { ...baseBody, fechaFacturacion, numeroCuenta };
+            const [nacR, intR] = await Promise.allSettled([
+              apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/nacional/resumen-por-fecha", resumenBody),
+              apiPost<ApiResumenFacturado>(page, "tarjetas/estadocuenta/internacional/resumen-por-fecha", resumenBody),
+            ]);
+            for (const [r, currency] of [[nacR, "CLP"], [intR, "USD"]] as const) {
+              if (r.status !== "fulfilled" || !r.value.existeEstadoCuenta) continue;
+              const res = r.value;
 
-            // Override nextBillingDate/nextDueDate with accurate date-format values from resumen
-            if (res.resumen?.fechaProximaFacturacion) ccEntry.nextBillingDate = normalizeDate(res.resumen.fechaProximaFacturacion);
-            if (!ccEntry.nextDueDate && res.resumen?.fechaVencimientoFacturacion) ccEntry.nextDueDate = normalizeDate(res.resumen.fechaVencimientoFacturacion);
+              const billed = billedStatementMovements(res, mascara, currency);
+              movements.push(...billed.movements);
+              debugLog.push(`  Estado de cuenta ${currency} ${fechaFacturacion}: ${billed.movements.length} movimiento(s)`);
+              if (billed.skipped.length > 0) debugLog.push(`    Filas sin fecha o monto usables: ${billed.skipped.join("; ")}`);
 
-            if (!ccEntry.lastStatement) {
-              const billedAmount = res.resumen?.montoFacturado ?? res.totalFacturado ?? res.montoTotalFacturado ?? res.montoTotal;
-              const dueDateRaw = res.resumen?.fechaVencimientoFacturacion ?? res.fechaVencimiento ?? res.fechaPago;
-              const minimumPayment = res.resumen?.pagoMinimo ?? res.pagoMinimo ?? res.montoMinimoPago ?? res.montoMinimoAPagar;
-              const billingDateRaw = res.resumen?.fechaFacturacionActual ?? latestFecha;
-              if (billedAmount && dueDateRaw) {
-                const billingDate = normalizeDate(billingDateRaw);
-                ccEntry.lastStatement = {
-                  billingDate,
-                  billedAmount,
-                  dueDate: normalizeDate(dueDateRaw),
-                  minimumPayment,
-                };
-                ccEntry.billingPeriod = monthYearLabel(billingDate);
+              if (!isLatest) continue;
+
+              // Override nextBillingDate/nextDueDate with accurate date-format values from resumen
+              if (res.resumen?.fechaProximaFacturacion) ccEntry.nextBillingDate = normalizeDate(res.resumen.fechaProximaFacturacion);
+              if (!ccEntry.nextDueDate && res.resumen?.fechaVencimientoFacturacion) ccEntry.nextDueDate = normalizeDate(res.resumen.fechaVencimientoFacturacion);
+
+              if (!ccEntry.lastStatement) {
+                const billedAmount = res.resumen?.montoFacturado ?? res.totalFacturado ?? res.montoTotalFacturado ?? res.montoTotal;
+                const dueDateRaw = res.resumen?.fechaVencimientoFacturacion ?? res.fechaVencimiento ?? res.fechaPago;
+                const minimumPayment = res.resumen?.pagoMinimo ?? res.pagoMinimo ?? res.montoMinimoPago ?? res.montoMinimoAPagar;
+                const billingDateRaw = res.resumen?.fechaFacturacionActual ?? fechaFacturacion;
+                if (billedAmount && dueDateRaw) {
+                  const billingDate = normalizeDate(billingDateRaw);
+                  ccEntry.lastStatement = {
+                    billingDate,
+                    billedAmount,
+                    dueDate: normalizeDate(dueDateRaw),
+                    minimumPayment,
+                  };
+                  ccEntry.billingPeriod = monthYearLabel(billingDate);
+                }
               }
             }
           }
@@ -496,7 +523,7 @@ async function scrapeBchile(session: BrowserSession, options: ScraperOptions): P
   // Credit card data
   debugLog.push("7. Fetching credit card data via API...");
   progress("Extrayendo datos de tarjeta de crédito...");
-  const tcResult = await fetchCreditCardData(page, fullName, debugLog);
+  const tcResult = await fetchCreditCardData(page, fullName, debugLog, options.statementMonths);
   debugLog.push(`  TC movements: ${tcResult.movements.length}`);
 
   // Distribute TC movements into each card's movements array

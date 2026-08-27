@@ -162,6 +162,7 @@ npx open-banking-chile --bank falabella --screenshots --pretty
 | `--screenshots`     | Guardar screenshots locales en `./screenshots/`                 |
 | `--headful`         | Chrome visible (debugging). **BancoEstado siempre usa headful** |
 | `--owner <T\|A\|B>` | Filtro Titular/Adicional para TC (default: B = todos)           |
+| `--statement-months <N>` | Estados de cuenta de TC a leer, del más reciente hacia atrás (default: 1). Solo Banco de Chile |
 
 ### Como librería
 
@@ -204,6 +205,27 @@ if (result.success) {
   }
 }
 ```
+
+### Meses anteriores de tarjeta de crédito (`statementMonths`)
+
+Un movimiento de TC sale del feed de no facturados en cuanto se factura, y desde
+ahí el banco solo lo expone dentro del estado de cuenta de su período. Por
+defecto se lee un solo estado de cuenta, el más reciente, así que todo lo
+facturado en períodos anteriores queda fuera. `statementMonths` decide cuántos
+leer, del más nuevo hacia atrás:
+
+```typescript
+const result = await getBank("bchile")!.scrape({
+  rut: "12345678-9",
+  password: "mi_clave",
+  statementMonths: 4,
+});
+```
+
+Cada período agrega dos llamadas a la API del banco, sin login extra. La
+metadata de la tarjeta (`nextBillingDate`, `nextDueDate`, `lastStatement`,
+`billingPeriod`) siempre sale del estado de cuenta más reciente. Hoy solo lo usa
+Banco de Chile.
 
 ### Output
 
