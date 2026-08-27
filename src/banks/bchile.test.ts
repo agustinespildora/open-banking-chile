@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { billedStatementMovements } from "./bchile.js";
+import { billedStatementMovements, statementDatesToRead } from "./bchile.js";
 
 /**
  * Recorte real de `tarjetas/estadocuenta/nacional/resumen-por-fecha`
@@ -104,5 +104,53 @@ describe("billedStatementMovements", () => {
         seccionCargosImpuestosAbonos: {},
       }),
     ).toEqual({ movements: [], skipped: [] });
+  });
+});
+
+/** `listaNacional` real: la más reciente primero. */
+const listaNacional = [
+  { fechaFacturacion: "2026-08-21" },
+  { fechaFacturacion: "2026-07-23" },
+  { fechaFacturacion: "2026-06-22" },
+  { fechaFacturacion: "2026-05-20" },
+];
+
+describe("statementDatesToRead", () => {
+  it("reads only the newest statement by default", () => {
+    expect(statementDatesToRead(listaNacional)).toEqual(["2026-08-21"]);
+  });
+
+  it("walks back from the newest one when asked for more", () => {
+    expect(statementDatesToRead(listaNacional, 3)).toEqual(["2026-08-21", "2026-07-23", "2026-06-22"]);
+  });
+
+  it("stops at what the bank offers", () => {
+    expect(statementDatesToRead(listaNacional, 99)).toEqual(["2026-08-21", "2026-07-23", "2026-06-22", "2026-05-20"]);
+  });
+
+  it("never reads less than one statement", () => {
+    for (const months of [0, -5, Number.NaN, 0.4]) {
+      expect(statementDatesToRead(listaNacional, months)).toEqual(["2026-08-21"]);
+    }
+  });
+
+  it("ignores repeated and empty billing dates", () => {
+    expect(
+      statementDatesToRead(
+        [
+          { fechaFacturacion: "2026-08-21" },
+          { fechaFacturacion: "2026-08-21" },
+          { fechaFacturacion: "" },
+          { fechaFacturacion: null as unknown as string },
+          { fechaFacturacion: "2026-07-23" },
+        ],
+        4,
+      ),
+    ).toEqual(["2026-08-21", "2026-07-23"]);
+  });
+
+  it("handles a missing list", () => {
+    expect(statementDatesToRead(undefined, 3)).toEqual([]);
+    expect(statementDatesToRead(null, 3)).toEqual([]);
   });
 });

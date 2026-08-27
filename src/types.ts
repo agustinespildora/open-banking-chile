@@ -133,6 +133,12 @@ export interface ScraperOptions extends BankCredentials {
   headful?: boolean;
   /** Filtro Titular/Adicional para TC (ej: "T" = titular, "A" = adicional, "B" = todos). Default: "B" */
   owner?: "T" | "A" | "B";
+  /**
+   * Cuántos estados de cuenta facturados de TC leer, del más reciente hacia
+   * atrás. Default: 1 (solo el último). Subirlo recupera los movimientos de
+   * meses anteriores, que el banco solo expone dentro de su estado de cuenta.
+   */
+  statementMonths?: number;
   /** Callback de progreso para mostrar estado al usuario */
   onProgress?: (step: string) => void;
   /** Callback invocado en cada línea de debug en tiempo real */
